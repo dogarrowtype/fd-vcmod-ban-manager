@@ -81,10 +81,13 @@ PROTECTED_ROLE_IDS = ALLOWED_ROLE_IDS + [
 
 
 def utc_to_local_timestamp(utc_datetime):
-    local_tz = ZoneInfo(time.tzname[0])
-    local_datetime = utc_datetime.replace(tzinfo=ZoneInfo("UTC")).astimezone(local_tz)
-    local_timestamp = local_datetime.timestamp()
-    return local_timestamp
+    # Assuming you want to convert to your local timezone
+    local_tz = ZoneInfo('America/New_York')  # Replace with your timezone
+    # Make sure the input datetime is timezone-aware
+    if utc_datetime.tzinfo is None:
+        utc_datetime = utc_datetime.replace(tzinfo=ZoneInfo('UTC'))
+    local_datetime = utc_datetime.astimezone(local_tz)
+    return local_datetime.timestamp()
 
 
 def has_permission():
