@@ -82,13 +82,12 @@ PROTECTED_ROLE_IDS = ALLOWED_ROLE_IDS + [
 
 def utc_to_local_timestamp(utc_datetime):
     # Assuming you want to convert to your local timezone
-    local_tz = ZoneInfo('America/New_York')  # Replace with your timezone
+    local_tz = ZoneInfo('America/Los_Angeles')  # Replace with your timezone
     # Make sure the input datetime is timezone-aware
     if utc_datetime.tzinfo is None:
         utc_datetime = utc_datetime.replace(tzinfo=ZoneInfo('UTC'))
     local_datetime = utc_datetime.astimezone(local_tz)
     return local_datetime.timestamp()
-
 
 def has_permission():
     def predicate(interaction: discord.Interaction) -> bool:
@@ -123,7 +122,7 @@ def usage_limit_check():
     return app_commands.check(predicate)
 
 
-@bot.tree.command(name="vcmute", description="Mute a user in voice channels")
+@bot.tree.command(name="vcmute", description="Ban user from seeing voice, even if rejoin.")
 @app_commands.describe(
     user="The user to mute",
     duration="Duration (e.g. 15m, 3h, or 5d)",
@@ -147,7 +146,7 @@ async def vcmute(
 
 
 @bot.tree.command(
-    name="vcban", description="Temporarily ban a user from voice channels"
+    name="vcban", description="Ban user from entire server. Only can see #contact-staff."
 )
 @app_commands.describe(
     user="The user to ban",
@@ -172,7 +171,6 @@ async def vcban(
         interaction, user, duration, reason, TEMP_BAN_ROLE_ID, "temp banned"
     )
 
-
 async def handle_punishment(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -188,7 +186,13 @@ async def handle_punishment(
         )
         return
 
-    expiry_time = parse_duration(duration)
+    expiry_time, error_message = parse_duration(duration)
+    if error_message:
+        await interaction.response.send_message(
+            f"Error: {error_message}", ephemeral=True
+        )
+        return
+
     if expiry_time is None:
         expiry_time = datetime.datetime.max
 
@@ -221,31 +225,66 @@ async def handle_punishment(
         ephemeral=True,
     )
 
-
-def parse_duration(duration: str) -> datetime.datetime:
+def parse_duration(duration: str) -> tuple[datetime.datetime, str]:
     if not duration:
-        return None
+        return None, None
 
-    unit = duration[-1].lower()
-    try:
-        value = int(duration[:-1])
-    except ValueError:
-        return None
+    # Valid units mapping
+    valid_units = {
+        'm': 'minutes',
+        'minutes': 'minutes',
+        'h': 'hours',
+        'hours': 'hours',
+        'd': 'days',
+        'days': 'days'
+    }
 
-    if unit == "m":
-        delta = datetime.timedelta(minutes=value)
-    elif unit == "h":
-        delta = datetime.timedelta(hours=value)
-    elif unit == "d":
-        delta = datetime.timedelta(days=value)
+    # Remove any leading/trailing whitespace and split by space
+    parts = duration.strip().split()
+    
+    if len(parts) == 1:
+        # Handle case with no space (e.g., "30m")
+        for i, c in enumerate(parts[0]):
+            if c.isalpha():
+                value_str = parts[0][:i]
+                unit = parts[0][i:].lower()
+                break
+        else:
+            return None, f"Invalid duration format.\nValid units are: m, minutes, h, hours, d, days. Or other error. Error code 0001."
+    elif len(parts) == 2:
+        # Handle case with space (e.g., "30 minutes")
+        value_str = parts[0]
+        unit = parts[1].lower()
     else:
-        return None
+        return None, f"Invalid duration format.\nValid units are: m, minutes, h, hours, d, days. Or other error. Error code 0002."
 
+    # Convert value to integer
+    try:
+        value = int(value_str) if value_str else 0
+    except ValueError:
+        return None, f"Invalid duration format.\nValid units are: m, minutes, h, hours, d, days. Or other error. Error code 0003."
+
+    # Check if the unit is valid
+    if unit not in valid_units:
+        return None, f"Invalid time unit: {unit}\nValid units are: m, minutes, h, hours, d, days. Or other error. Error code 0004."
+
+    # Create timedelta based on the unit
+    if valid_units[unit] == 'minutes':
+        delta = datetime.timedelta(minutes=value)
+    elif valid_units[unit] == 'hours':
+        delta = datetime.timedelta(hours=value)
+    elif valid_units[unit] == 'days':
+        delta = datetime.timedelta(days=value)
+
+    # Check minimum duration (1 minute)
+    if delta < datetime.timedelta(minutes=1):
+        return None, "Duration must be at least 1 minute"
+
+    # Check maximum duration
     if delta > MAX_DURATION:
         delta = MAX_DURATION
 
-    return datetime.datetime.utcnow() + delta
-
+    return datetime.datetime.utcnow() + delta, None
 
 async def log_action(channel, user, action, expiry_time, reason, issuer=None):
     if expiry_time and expiry_time != datetime.datetime.max:
@@ -304,17 +343,18 @@ async def on_app_command_error(
     if isinstance(error, app_commands.errors.CheckFailure):
         if "Usage limit exceeded" in str(error):
             await interaction.response.send_message(
-                f"Usage limit exceeded. The bot can only be used {MAX_USES_PER_HOUR:d} times per hour. Please try again later.",
+                f"Usage limit exceeded. The bot can only be used {MAX_USES_PER_HOUR:d} times per hour. Please try again later. Error code 0005.",
                 ephemeral=True,
             )
         else:
             await interaction.response.send_message(
-                "You don't have permission to use this command.", ephemeral=True
+                "You don't have permission to use this command. Error code 0006.", ephemeral=True
             )
     else:
         await interaction.response.send_message(
             f"An error occurred: {str(error)}", ephemeral=True
         )
+        logger.info(f"An error occurred: {str(error)}")
 
 
 bot.run(BOT_TOKEN)
