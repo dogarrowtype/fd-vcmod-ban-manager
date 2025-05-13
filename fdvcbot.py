@@ -11,7 +11,6 @@ from collections import deque
 from dotenv import load_dotenv
 
 intents = discord.Intents.all()
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -19,7 +18,7 @@ class ModBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
         self.db = None
-
+        
     async def setup_hook(self):
         # This will sync the application commands with Discord
         await self.tree.sync()
@@ -30,20 +29,19 @@ class ModBot(commands.Bot):
                        expiry_time TIMESTAMP, reason TEXT, issuer_id INTEGER)"""
         )
         await self.db.commit()
-
+        
     async def on_ready(self):
         logger.info(f"{self.user} has connected to Discord!")
         check_expired_punishments.start()
-        verify_punishment_roles.start()  # Start the verification task
-
+        verify_punishment_roles.start()  # Start the new verification task
+        
     async def close(self):
         await self.db.close()
         await super().close()
 
-
 bot = ModBot()
-
 load_dotenv()
+
 # Configuration
 BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")  # FILL ME
 LOG_CHANNEL_ID = 1222257923921674300  # #mod-lobby
@@ -80,7 +78,6 @@ PROTECTED_ROLE_IDS = ALLOWED_ROLE_IDS + [
     1260276484220649614,  # FD VC Bot
 ]
 
-
 def utc_to_local_timestamp(utc_datetime):
     # Assuming you want to convert to your local timezone
     local_tz = ZoneInfo('America/Los_Angeles')  # Replace with your timezone
@@ -93,24 +90,18 @@ def utc_to_local_timestamp(utc_datetime):
 def has_permission():
     def predicate(interaction: discord.Interaction) -> bool:
         return any(role.id in ALLOWED_ROLE_IDS for role in interaction.user.roles)
-
     return app_commands.check(predicate)
-
 
 def is_protected(member: discord.Member) -> bool:
     return any(role.id in PROTECTED_ROLE_IDS for role in member.roles)
 
-
 def check_usage_limit():
     current_time = time.time()
     usage_times.append(current_time)
-
     # Remove usage times older than 1 hour
     while usage_times and current_time - usage_times[0] > 3600:
         usage_times.popleft()
-
     return len(usage_times) <= MAX_USES_PER_HOUR
-
 
 def usage_limit_check():
     def predicate(interaction: discord.Interaction) -> bool:
@@ -119,9 +110,7 @@ def usage_limit_check():
                 "Usage limit exceeded. Please try again later."
             )
         return True
-
     return app_commands.check(predicate)
-
 
 @bot.tree.command(name="vcmute", description="Ban user from seeing voice, even if rejoin.")
 @app_commands.describe(
@@ -144,7 +133,6 @@ async def vcmute(
         )
         return
     await handle_punishment(interaction, user, duration, reason, MUTE_ROLE_ID, "muted")
-
 
 @bot.tree.command(
     name="vcban", description="Ban user from entire server. Only can see #contact-staff."
@@ -172,6 +160,76 @@ async def vcban(
         interaction, user, duration, reason, TEMP_BAN_ROLE_ID, "temp banned"
     )
 
+@bot.tree.command(name="vcunmute", description="Remove voice mute from a user")
+@app_commands.describe(
+    user="The user to unmute",
+    reason="Reason for unmuting",
+)
+@app_commands.guild_only()
+@has_permission()
+@usage_limit_check()
+async def vcunmute(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    reason: str = "No reason provided",
+):
+    await remove_punishment(interaction, user, MUTE_ROLE_ID, "muted", reason)
+
+@bot.tree.command(name="vcunban", description="Remove temporary ban from a user")
+@app_commands.describe(
+    user="The user to unban",
+    reason="Reason for unbanning",
+)
+@app_commands.guild_only()
+@has_permission()
+@usage_limit_check()
+async def vcunban(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    reason: str = "No reason provided",
+):
+    await remove_punishment(interaction, user, TEMP_BAN_ROLE_ID, "banned", reason)
+
+async def remove_punishment(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    role_id: int,
+    action: str,
+    reason: str,
+):
+    role = interaction.guild.get_role(role_id)
+    if not role:
+        await interaction.response.send_message(
+            f"Error: Role not found.", ephemeral=True
+        )
+        return
+
+    # Check if the role is applied to the user
+    if role not in user.roles:
+        await interaction.response.send_message(
+            f"{user.mention} is not currently {action}.", ephemeral=True
+        )
+        return
+
+    # Remove the role
+    await user.remove_roles(role, reason=reason)
+    
+    # Remove from database
+    await bot.db.execute(
+        "DELETE FROM punishments WHERE user_id = ? AND guild_id = ? AND role_id = ?",
+        (user.id, interaction.guild.id, role_id)
+    )
+    await bot.db.commit()
+
+    # Log the action
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    await log_action(log_channel, user, action, None, reason, interaction.user, is_removal=True)
+
+    await interaction.response.send_message(
+        f"{user.mention} has been un{action}. Reason: {reason}",
+        ephemeral=True,
+    )
+
 async def handle_punishment(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -197,8 +255,17 @@ async def handle_punishment(
     if expiry_time is None:
         expiry_time = datetime.datetime.max
 
-    await user.add_roles(role, reason=reason)
+    # First, remove any existing punishment of the same type
+    await bot.db.execute(
+        "DELETE FROM punishments WHERE user_id = ? AND guild_id = ? AND role_id = ?",
+        (user.id, interaction.guild.id, role_id)
+    )
+    await bot.db.commit()
 
+    # Add the role if not already applied
+    if role not in user.roles:
+        await user.add_roles(role, reason=reason)
+    
     # Store punishment in database
     await bot.db.execute(
         "INSERT INTO punishments VALUES (?, ?, ?, ?, ?, ?)",
@@ -229,7 +296,7 @@ async def handle_punishment(
 def parse_duration(duration: str) -> tuple[datetime.datetime, str]:
     if not duration:
         return None, None
-
+    
     # Valid units mapping
     valid_units = {
         'm': 'minutes',
@@ -239,10 +306,9 @@ def parse_duration(duration: str) -> tuple[datetime.datetime, str]:
         'd': 'days',
         'days': 'days'
     }
-
+    
     # Remove any leading/trailing whitespace and split by space
     parts = duration.strip().split()
-    
     if len(parts) == 1:
         # Handle case with no space (e.g., "30m")
         for i, c in enumerate(parts[0]):
@@ -258,17 +324,17 @@ def parse_duration(duration: str) -> tuple[datetime.datetime, str]:
         unit = parts[1].lower()
     else:
         return None, f"Invalid duration format.\nValid units are: m, minutes, h, hours, d, days. Or other error. Error code 0002."
-
+    
     # Convert value to integer
     try:
         value = int(value_str) if value_str else 0
     except ValueError:
         return None, f"Invalid duration format.\nValid units are: m, minutes, h, hours, d, days. Or other error. Error code 0003."
-
+    
     # Check if the unit is valid
     if unit not in valid_units:
         return None, f"Invalid time unit: {unit}\nValid units are: m, minutes, h, hours, d, days. Or other error. Error code 0004."
-
+    
     # Create timedelta based on the unit
     if valid_units[unit] == 'minutes':
         delta = datetime.timedelta(minutes=value)
@@ -276,36 +342,38 @@ def parse_duration(duration: str) -> tuple[datetime.datetime, str]:
         delta = datetime.timedelta(hours=value)
     elif valid_units[unit] == 'days':
         delta = datetime.timedelta(days=value)
-
+    
     # Check minimum duration (1 minute)
     if delta < datetime.timedelta(minutes=1):
         return None, "Duration must be at least 1 minute"
-
+    
     # Check maximum duration
     if delta > MAX_DURATION:
         delta = MAX_DURATION
-
+    
     return datetime.datetime.utcnow() + delta, None
 
-async def log_action(channel, user, action, expiry_time, reason, issuer=None):
+async def log_action(channel, user, action, expiry_time, reason, issuer=None, is_removal=False):
     if expiry_time and expiry_time != datetime.datetime.max:
         duration = f"until <t:{utc_to_local_timestamp(expiry_time):.0f}:F>"
     else:
         duration = "indefinitely"
-
-    if issuer:
+    
+    if is_removal:
+        logger.info(f"{user.mention} has been un{action} by {issuer.mention}. Reason: {reason}")
+        await channel.send(
+            f"{user.mention} has been un{action} by {issuer.mention}. Reason: {reason}"
+        )
+    elif issuer:
         logger.info(f"{user.mention} has been {action} {duration} by {issuer.mention}. Reason: {reason}")
-
         await channel.send(
             f"{user.mention} has been {action} {duration} by {issuer.mention}. Reason: {reason}"
         )
     else:
-        logger.info(f"{user.mention} has been un{action} {duration}. Reason: {reason}")
-
+        logger.info(f"{user.mention} has been un{action} automatically. Reason: {reason}")
         await channel.send(
-            f"{user.mention} has been un{action} {duration}. Reason: {reason}"
+            f"{user.mention} has been un{action} automatically. Reason: {reason}"
         )
-
 
 @tasks.loop(minutes=1)
 async def check_expired_punishments():
@@ -314,7 +382,7 @@ async def check_expired_punishments():
         "SELECT * FROM punishments WHERE expiry_time <= ?", (now,)
     ) as cursor:
         expired_punishments = await cursor.fetchall()
-
+    
     for punishment in expired_punishments:
         user_id, guild_id, role_id, _, _, _ = punishment
         guild = bot.get_guild(guild_id)
@@ -331,12 +399,12 @@ async def check_expired_punishments():
                     await log_action(
                         log_channel, member, action, None, "Punishment duration expired"
                     )
-
+    
     # Remove expired punishments from the database
     await bot.db.execute("DELETE FROM punishments WHERE expiry_time <= ?", (now,))
     await bot.db.commit()
 
-@tasks.loop(seconds=15)  # New task to verify punishment roles every 15 seconds
+@tasks.loop(seconds=30)  # New task to verify punishment roles every 30 seconds
 async def verify_punishment_roles():
     try:
         now = datetime.datetime.utcnow()
@@ -354,20 +422,29 @@ async def verify_punishment_roles():
                 if member and not is_protected(member):
                     role = guild.get_role(role_id)
                     if role and role not in member.roles:
-                        # Role is missing - reapply it
-                        await member.add_roles(role, reason=f"Reapplying punishment role: {reason}")
-                        log_channel = bot.get_channel(LOG_CHANNEL_ID)
-                        action = "muted" if role_id == MUTE_ROLE_ID else "banned"
-                        
-                        # Get issuer name if possible
-                        issuer = guild.get_member(issuer_id)
-                        issuer_name = f"{issuer.mention}" if issuer else "System"
-                        
-                        await log_channel.send(
-                            f"⚠️ Reapplied {action} role to {member.mention}. Role was missing but punishment is still active. "
-                            f"Original reason: {reason}. Original issuer: {issuer_name}"
-                        )
-                        logger.info(f"Reapplied {action} role to {member.display_name} (ID: {member.id})")
+                        # Double-check that the punishment is still active in the database
+                        # This extra check ensures we don't reapply roles if someone manually unmuted/unbanned
+                        # and the database wasn't updated properly
+                        async with bot.db.execute(
+                            "SELECT COUNT(*) FROM punishments WHERE user_id = ? AND guild_id = ? AND role_id = ? AND expiry_time > ?",
+                            (user_id, guild_id, role_id, now)
+                        ) as count_cursor:
+                            count = await count_cursor.fetchone()
+                            if count and count[0] > 0:
+                                # Role is missing but punishment is still active - reapply it
+                                await member.add_roles(role, reason=f"Reapplying punishment role: {reason}")
+                                log_channel = bot.get_channel(LOG_CHANNEL_ID)
+                                action = "muted" if role_id == MUTE_ROLE_ID else "banned"
+                                
+                                # Get issuer name if possible
+                                issuer = guild.get_member(issuer_id)
+                                issuer_name = f"{issuer.mention}" if issuer else "System"
+                                
+                                await log_channel.send(
+                                    f"⚠️ Reapplied {action} role to {member.mention}. Role was missing but punishment is still active. "
+                                    f"Original reason: {reason}. Original issuer: {issuer_name}"
+                                )
+                                logger.info(f"Reapplied {action} role to {member.display_name} (ID: {member.id})")
     except Exception as e:
         logger.error(f"Error in verify_punishment_roles task: {str(e)}")
 
@@ -390,6 +467,5 @@ async def on_app_command_error(
             f"An error occurred: {str(error)}", ephemeral=True
         )
         logger.info(f"An error occurred: {str(error)}")
-
 
 bot.run(BOT_TOKEN)
