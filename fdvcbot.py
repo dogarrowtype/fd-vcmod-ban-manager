@@ -34,6 +34,7 @@ class ModBot(commands.Bot):
     async def on_ready(self):
         logger.info(f"{self.user} has connected to Discord!")
         check_expired_punishments.start()
+        verify_punishment_roles.start()  # Start the verification task
 
     async def close(self):
         await self.db.close()
@@ -335,6 +336,40 @@ async def check_expired_punishments():
     await bot.db.execute("DELETE FROM punishments WHERE expiry_time <= ?", (now,))
     await bot.db.commit()
 
+@tasks.loop(seconds=15)  # New task to verify punishment roles every 15 seconds
+async def verify_punishment_roles():
+    try:
+        now = datetime.datetime.utcnow()
+        # Get all active punishments (not expired)
+        async with bot.db.execute(
+            "SELECT * FROM punishments WHERE expiry_time > ?", (now,)
+        ) as cursor:
+            active_punishments = await cursor.fetchall()
+        
+        for punishment in active_punishments:
+            user_id, guild_id, role_id, expiry_time, reason, issuer_id = punishment
+            guild = bot.get_guild(guild_id)
+            if guild:
+                member = guild.get_member(user_id)
+                if member and not is_protected(member):
+                    role = guild.get_role(role_id)
+                    if role and role not in member.roles:
+                        # Role is missing - reapply it
+                        await member.add_roles(role, reason=f"Reapplying punishment role: {reason}")
+                        log_channel = bot.get_channel(LOG_CHANNEL_ID)
+                        action = "muted" if role_id == MUTE_ROLE_ID else "banned"
+                        
+                        # Get issuer name if possible
+                        issuer = guild.get_member(issuer_id)
+                        issuer_name = f"{issuer.mention}" if issuer else "System"
+                        
+                        await log_channel.send(
+                            f"⚠️ Reapplied {action} role to {member.mention}. Role was missing but punishment is still active. "
+                            f"Original reason: {reason}. Original issuer: {issuer_name}"
+                        )
+                        logger.info(f"Reapplied {action} role to {member.display_name} (ID: {member.id})")
+    except Exception as e:
+        logger.error(f"Error in verify_punishment_roles task: {str(e)}")
 
 @bot.tree.error
 async def on_app_command_error(
