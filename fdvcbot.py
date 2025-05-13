@@ -197,16 +197,19 @@ async def remove_punishment(
     action: str,
     reason: str,
 ):
+    # Respond to interaction immediately
+    await interaction.response.defer(ephemeral=True)
+    
     role = interaction.guild.get_role(role_id)
     if not role:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Error: Role not found.", ephemeral=True
         )
         return
 
     # Check if the role is applied to the user
     if role not in user.roles:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"{user.mention} is not currently {action}.", ephemeral=True
         )
         return
@@ -225,7 +228,7 @@ async def remove_punishment(
     log_channel = bot.get_channel(LOG_CHANNEL_ID)
     await log_action(log_channel, user, action, None, reason, interaction.user, is_removal=True)
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"{user.mention} has been un{action}. Reason: {reason}",
         ephemeral=True,
     )
@@ -238,16 +241,19 @@ async def handle_punishment(
     role_id: int,
     action: str,
 ):
+    # Respond to interaction immediately
+    await interaction.response.defer(ephemeral=True)
+    
     role = interaction.guild.get_role(role_id)
     if not role:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Error: Role not found.", ephemeral=True
         )
         return
 
     expiry_time, error_message = parse_duration(duration)
     if error_message:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Error: {error_message}", ephemeral=True
         )
         return
@@ -288,7 +294,7 @@ async def handle_punishment(
     else:
         until_str = "indefinitely"
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"{user.mention} has been {action} until {until_str}. Reason: {reason}",
         ephemeral=True,
     )
@@ -452,20 +458,40 @@ async def verify_punishment_roles():
 async def on_app_command_error(
     interaction: discord.Interaction, error: app_commands.AppCommandError
 ):
-    if isinstance(error, app_commands.errors.CheckFailure):
-        if "Usage limit exceeded" in str(error):
-            await interaction.response.send_message(
-                f"Usage limit exceeded. The bot can only be used {MAX_USES_PER_HOUR:d} times per hour. Please try again later. Error code 0005.",
-                ephemeral=True,
-            )
+    try:
+        if isinstance(error, app_commands.errors.CheckFailure):
+            if "Usage limit exceeded" in str(error):
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        f"Usage limit exceeded. The bot can only be used {MAX_USES_PER_HOUR:d} times per hour. Please try again later. Error code 0005.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.followup.send(
+                        f"Usage limit exceeded. The bot can only be used {MAX_USES_PER_HOUR:d} times per hour. Please try again later. Error code 0005.",
+                        ephemeral=True,
+                    )
+            else:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "You don't have permission to use this command. Error code 0006.", ephemeral=True
+                    )
+                else:
+                    await interaction.followup.send(
+                        "You don't have permission to use this command. Error code 0006.", ephemeral=True
+                    )
         else:
-            await interaction.response.send_message(
-                "You don't have permission to use this command. Error code 0006.", ephemeral=True
-            )
-    else:
-        await interaction.response.send_message(
-            f"An error occurred: {str(error)}", ephemeral=True
-        )
-        logger.info(f"An error occurred: {str(error)}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {str(error)}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {str(error)}", ephemeral=True
+                )
+            logger.info(f"An error occurred: {str(error)}")
+    except discord.errors.NotFound:
+        # Interaction timed out or was already acknowledged
+        logger.warning(f"Could not respond to interaction, may have timed out: {str(error)}")
 
 bot.run(BOT_TOKEN)
